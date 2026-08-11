@@ -38,11 +38,19 @@ Dynamic Sky for Godot Engine 4.5
 
 ## Volumetric Clouds
 
-Add a `VolumetricClouds` resource to your `StandardSkyMaterial` to configure coverage, density, wind, lighting, resolution, and update speed.
 
 Volumetric clouds use compute shaders and require the Forward+ renderer. See `example/volumetric_clouds.tscn` for a configured example.
 
-Lower update-frame values provide faster visual updates, while higher values reduce the per-frame GPU cost.
+The quality preset changes only view and light ray samples:
+
+| Preset | View samples | Light samples |
+| --- | ---: | ---: |
+| Performance | 64 | 3 |
+| Balanced | 96 | 4 |
+| High | 128 | 6 |
+| Ultra | 160 | 8 |
+
+Texture resolution and `frames_to_update` remain independent. Lower "update frame" values provide faster visual updates, while higher values reduce the per-frame GPU cost. `weather_skip_threshold` and `density_skip_threshold` are lossless at zero. Raising them trades tenuous cloud detail for faster rendering.
 
 ## Screenshots
 

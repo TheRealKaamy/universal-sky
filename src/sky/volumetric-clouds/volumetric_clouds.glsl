@@ -10,6 +10,7 @@ layout(rgba16f, set = 0, binding = 0) uniform restrict writeonly image2D current
 layout(set = 1, binding = 0) uniform sampler3D large_scale_noise;
 layout(set = 1, binding = 1) uniform sampler3D small_scale_noise;
 layout(set = 1, binding = 2) uniform sampler2D weather_noise;
+layout(set = 1, binding = 3) uniform sampler2D blue_noise;
 
 // 128-byte push-constant limit.
 layout(push_constant, std430) uniform Params {
@@ -33,28 +34,48 @@ layout(push_constant, std430) uniform Params {
     float pad2;
 } params;
 
-const float GROUND_RADIUS = 6000000.0;
-const float CLOUD_BOTTOM_RADIUS = 6001500.0;
-const float CLOUD_TOP_RADIUS = 6004000.0;
+layout(std140, set = 2, binding = 0) uniform CloudConfig {
+    vec4 layer;
+    vec4 noise;
+    vec4 erosion;
+    vec4 phase;
+    vec4 lighting;
+    vec4 sampling;
+    vec4 aerial;
+    vec4 reserved;
+} config;
 
-float hash(vec3 p) {
-    p = fract(p * 0.3183099 + 0.1);
-    p *= 17.0;
-    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+const float GROUND_RADIUS = 6000000.0;
+const int MAX_VIEW_SAMPLES = 160;
+const int MAX_LIGHT_SAMPLES = 8;
+const float EPSILON = 0.000001;
+
+float cloud_bottom_radius() {
+    return GROUND_RADIUS + max(config.layer.x, 0.0);
 }
 
-float remap(float value, float old_min, float old_max, float new_min, float new_max) {
-    return new_min + (((value - old_min) / (old_max - old_min)) * (new_max - new_min));
+float cloud_top_radius() {
+    return cloud_bottom_radius() + max(config.layer.y, 1.0);
 }
 
 float henyey_greenstein(float cos_theta, float g) {
     const float INV_4PI = 0.0795774715459;
-    return INV_4PI * (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cos_theta, 1.5);
+    g = clamp(g, -0.95, 0.95);
+    float denominator = max(1.0 + g * g - 2.0 * g * clamp(cos_theta, -1.0, 1.0), EPSILON);
+    return INV_4PI * (1.0 - g * g) / pow(denominator, 1.5);
+}
+
+float dual_lobe_henyey_greenstein(float cos_theta, vec2 anisotropy, float backward_weight) {
+    return mix(
+        henyey_greenstein(cos_theta, anisotropy.x),
+        henyey_greenstein(cos_theta, anisotropy.y),
+        clamp(backward_weight, 0.0, 1.0)
+    );
 }
 
 float height_fraction(float radius) {
     return clamp(
-        (radius - CLOUD_BOTTOM_RADIUS) / (CLOUD_TOP_RADIUS - CLOUD_BOTTOM_RADIUS),
+        (radius - cloud_bottom_radius()) / max(config.layer.y, 1.0),
         0.0,
         1.0
     );
@@ -72,143 +93,298 @@ vec4 mix_gradients(float cloud_type) {
 
 float density_height_gradient(float height_frac, float cloud_type) {
     vec4 gradient = mix_gradients(cloud_type);
-    return smoothstep(gradient.x, gradient.y, height_frac)
-        - smoothstep(gradient.z, gradient.w, height_frac);
+    return max(
+        smoothstep(gradient.x, gradient.y, height_frac)
+            - smoothstep(gradient.z, gradient.w, height_frac),
+        0.0
+    );
 }
 
-float intersect_sphere(vec3 pos, vec3 dir, float radius) {
-    float a = dot(dir, dir);
-    float b = 2.0 * dot(dir, pos);
+float sphere_far_distance(vec3 pos, vec3 dir, float radius) {
+    float b = dot(dir, pos);
     float c = dot(pos, pos) - radius * radius;
-    float discriminant = max(0.0, b * b - 4.0 * a * c);
-    return max(-b - sqrt(discriminant), -b + sqrt(discriminant)) / (2.0 * a);
+    float discriminant = b * b - c;
+    if (discriminant < 0.0) {
+        return -1.0;
+    }
+    return -b + sqrt(discriminant);
 }
 
-float sample_density(vec3 point, vec3 weather, float mip) {
+float sphere_near_distance(vec3 pos, vec3 dir, float radius) {
+    float b = dot(dir, pos);
+    float c = dot(pos, pos) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0) {
+        return -1.0;
+    }
+
+    float root = sqrt(discriminant);
+    float near_distance = -b - root;
+    if (near_distance > EPSILON) {
+        return near_distance;
+    }
+
+    float far_distance = -b + root;
+    return far_distance > EPSILON ? far_distance : -1.0;
+}
+
+float sample_density(vec3 point, float mip) {
+    float radius = length(point);
+    float bottom_radius = cloud_bottom_radius();
+    float top_radius = cloud_top_radius();
+    if (radius <= bottom_radius || radius >= top_radius) {
+        return 0.0;
+    }
+
+    float height_frac = height_fraction(radius);
+    vec3 weather = texture(
+        weather_noise,
+        point.xz * max(config.noise.x, 0.0) + 0.5 + params.weather_pos
+    ).xyz;
+    float weather_coverage = clamp(params.cloud_coverage * weather.b, 0.0, 1.0);
+    float weather_skip = max(config.layer.z, 0.0);
+    if (weather_coverage <= weather_skip) {
+        return 0.0;
+    }
+
+    float height_gradient = density_height_gradient(height_frac, weather.r);
+    if (height_gradient <= 0.0) {
+        return 0.0;
+    }
+
     vec3 p = point;
-    float height_frac = height_fraction(length(p));
-
     p.xz += 20.0 * params.cloud_pos * 0.6;
-    vec4 noise = textureLod(large_scale_noise, p * 0.00008, mip - 2.0);
-    float fbm = noise.g * 0.625 + noise.b * 0.25 + noise.a * 0.125;
+    vec4 base_noise = textureLod(
+        large_scale_noise,
+        p * max(config.noise.y, 0.0),
+        max(mip - 2.0, 0.0)
+    );
+    float base_fbm = base_noise.g * 0.625 + base_noise.b * 0.25 + base_noise.a * 0.125;
+    float base_cloud = clamp(
+        (base_noise.r + 1.0 - base_fbm) / max(2.0 - base_fbm, EPSILON),
+        0.0,
+        1.0
+    );
+    base_cloud = clamp(
+        (base_cloud * height_gradient - (1.0 - weather_coverage))
+            / max(weather_coverage, EPSILON),
+        0.0,
+        1.0
+    ) * weather_coverage;
 
-    float gradient = density_height_gradient(height_frac, weather.r);
-    float base_cloud = remap(noise.r, -(1.0 - fbm), 1.0, 0.0, 1.0);
-    float weather_coverage = params.cloud_coverage * weather.b;
-    base_cloud = remap(base_cloud * gradient, 1.0 - weather_coverage, 1.0, 0.0, 1.0);
-    base_cloud *= weather_coverage;
+    float density_skip = max(config.layer.w, 0.0);
+    if (base_cloud <= density_skip) {
+        return 0.0;
+    }
 
     p.xz -= params.detailed_pos * 40.0;
     p.y -= params.time * 40.0;
-    vec3 high_frequency_noise = textureLod(small_scale_noise, p * 0.001, mip).rgb;
-    float high_frequency_fbm = high_frequency_noise.r * 0.625
-            + high_frequency_noise.g * 0.25
-            + high_frequency_noise.b * 0.125;
-    high_frequency_fbm = mix(
-            high_frequency_fbm,
-            1.0 - high_frequency_fbm,
-            clamp(height_frac * 4.0, 0.0, 1.0)
-        );
-    base_cloud = remap(base_cloud, high_frequency_fbm * 0.4 * height_frac, 1.0, 0.0, 1.0);
-    return pow(clamp(base_cloud, 0.0, 1.0), (1.0 - height_frac) * 0.8 + 0.5);
+    vec3 detail_noise = textureLod(
+        small_scale_noise,
+        p * max(config.noise.z, 0.0),
+        max(mip, 0.0)
+    ).rgb;
+    float detail_fbm = detail_noise.r * 0.625
+            + detail_noise.g * 0.25
+            + detail_noise.b * 0.125;
+    float inversion_height = max(config.noise.w, EPSILON);
+    detail_fbm = mix(
+        detail_fbm,
+        1.0 - detail_fbm,
+        clamp(height_frac / inversion_height, 0.0, 1.0)
+    );
+
+    float erosion_height = mix(
+        1.0,
+        height_frac,
+        clamp(config.erosion.y, 0.0, 1.0)
+    );
+    float erosion_amount = clamp(
+        detail_fbm * max(config.erosion.x, 0.0) * erosion_height,
+        0.0,
+        1.0 - EPSILON
+    );
+    base_cloud = clamp(
+        (base_cloud - erosion_amount) / max(1.0 - erosion_amount, EPSILON),
+        0.0,
+        1.0
+    );
+    if (base_cloud <= density_skip) {
+        return 0.0;
+    }
+
+    float density_power = mix(
+        max(config.erosion.z, EPSILON),
+        max(config.erosion.w, EPSILON),
+        height_frac
+    );
+    return pow(base_cloud, density_power);
 }
 
-vec4 march_clouds(vec3 start, vec3 ray_step, int step_count) {
-    const vec3 RANDOM_VECTORS[6] = {
-            vec3(0.38051305, 0.92453449, -0.02111345),
-            vec3(-0.50625799, -0.03590792, -0.86163418),
-            vec3(-0.32509218, -0.94557439, 0.01428793),
-            vec3(0.09026238, -0.27376545, 0.95755165),
-            vec3(0.28128598, 0.42443639, -0.86065785),
-            vec3(-0.16852403, 0.14748697, 0.97460106)
-        };
+float light_path_length(vec3 point, vec3 light_direction) {
+    float top_exit = sphere_far_distance(point, light_direction, cloud_top_radius());
+    if (top_exit <= 0.0) {
+        return 0.0;
+    }
 
-    float step_size = length(ray_step);
-    vec3 direction = normalize(ray_step);
-    vec3 p = start + direction * hash(start * 10.0) * step_size;
-    float light_step_size = (CLOUD_TOP_RADIUS - CLOUD_BOTTOM_RADIUS) / 64.0;
+    float bottom_entry = sphere_near_distance(point, light_direction, cloud_bottom_radius());
+    if (bottom_entry > 0.0 && bottom_entry < top_exit) {
+        return bottom_entry;
+    }
+    return top_exit;
+}
+
+vec4 march_clouds(
+        vec3 start,
+        vec3 direction,
+        float ray_length,
+        int step_count,
+        float jitter
+    ) {
+    float step_size = ray_length / float(step_count);
+    vec3 p = start + direction * jitter * step_size;
     vec3 light_direction = normalize(params.light_direction);
 
     float transmittance = 1.0;
-    float alpha = 0.0;
     vec3 luminance = vec3(0.0);
     float cos_theta = dot(light_direction, direction);
-    float phase = max(
-            max(
-                henyey_greenstein(cos_theta, 0.6),
-                henyey_greenstein(cos_theta, 0.4 - 1.4 * light_direction.y)
-            ),
-            henyey_greenstein(cos_theta, -0.2)
-        );
+    vec2 phase_anisotropy = config.phase.xy;
+    float phase_single = dual_lobe_henyey_greenstein(
+        cos_theta,
+        phase_anisotropy,
+        config.phase.z
+    );
+    float phase_multiple = dual_lobe_henyey_greenstein(
+        cos_theta,
+        phase_anisotropy * 0.5,
+        config.phase.z
+    );
 
     vec3 direct_light = params.light_color
             * params.light_energy
             * params.direct_light_multiplier;
     vec3 ambient_light = params.ambient_color * params.ambient_light_multiplier;
     vec3 ground_light = params.ground_color * params.ground_light_multiplier;
-    const float WEATHER_SCALE = 0.00006;
+    int light_sample_count = int(clamp(floor(config.sampling.y + 0.5), 1.0, 8.0));
+    float early_exit = clamp(config.lighting.w, 0.0, 1.0);
 
-    for (int i = 0; i < step_count; i++) {
-        p += direction * step_size;
-        vec3 weather = texture(weather_noise, p.xz * WEATHER_SCALE + 0.5 + params.weather_pos).xyz;
-        float height_frac = height_fraction(length(p));
-        float cloud_density = sample_density(p, weather, 0.0);
-        float step_transmittance = exp(-params.density * cloud_density * step_size);
+    for (int i = 0; i < MAX_VIEW_SAMPLES; i++) {
+        if (i >= step_count) {
+            break;
+        }
 
+        float radius = length(p);
+        float height_frac = height_fraction(radius);
+        float cloud_density = sample_density(p, 0.0);
         if (cloud_density > 0.0) {
-            vec3 light_point = p;
-            float accumulated_density = 0.0;
-            for (int j = 0; j < 6; j++) {
-                light_point += (light_direction + RANDOM_VECTORS[j] * float(j)) * light_step_size;
-                vec3 light_weather = texture(
-                        weather_noise,
-                        light_point.xz * WEATHER_SCALE + 0.5 + params.weather_pos
-                    ).xyz;
-                accumulated_density += sample_density(light_point, light_weather, float(j));
+            float tau_step = max(params.density, 0.0) * cloud_density * step_size;
+            float step_transmittance = exp(-tau_step);
+            float segment_alpha = 1.0 - step_transmittance;
+
+            float single_scattering = 0.0;
+            float multiple_scattering = 0.0;
+            bool ground_occluded = sphere_near_distance(
+                p,
+                light_direction,
+                GROUND_RADIUS
+            ) > 0.0;
+            float light_distance = ground_occluded ? 0.0 : light_path_length(p, light_direction);
+            if (light_distance > 0.0) {
+                float light_step_size = light_distance / float(light_sample_count);
+                float integrated_light_density = 0.0;
+                for (int j = 0; j < MAX_LIGHT_SAMPLES; j++) {
+                    if (j >= light_sample_count) {
+                        break;
+                    }
+                    float sample_distance = (float(j) + jitter) * light_step_size;
+                    vec3 light_point = p + light_direction * sample_distance;
+                    float light_mip = light_sample_count > 1
+                        ? 5.0 * float(j) / float(light_sample_count - 1)
+                        : 0.0;
+                    integrated_light_density += sample_density(light_point, light_mip)
+                        * light_step_size;
+                }
+
+                float tau_light = max(params.density, 0.0) * integrated_light_density;
+                float beer = exp(-tau_light);
+                float powder = 1.0 - beer * beer;
+                single_scattering = 2.0 * beer * powder * phase_single;
+
+                float multiple_extinction = max(config.lighting.x, 0.0);
+                float multiple_transmittance = exp(-tau_light * multiple_extinction);
+                multiple_scattering = max(config.phase.w, 0.0)
+                    * multiple_transmittance
+                    * (1.0 - beer)
+                    * phase_multiple;
             }
 
-            light_point = p + light_direction * 18.0 * light_step_size;
-            float light_height_frac = height_fraction(length(light_point));
-            vec3 distant_weather = texture(
-                    weather_noise,
-                    light_point.xz * WEATHER_SCALE + 0.5 + params.weather_pos
-                ).xyz;
-            accumulated_density += pow(
-                    sample_density(light_point, distant_weather, 5.0),
-                    (1.0 - light_height_frac) * 0.8 + 0.5
-                );
-
-            float beers = exp(-params.density * accumulated_density * light_step_size * 3.0);
-            float powder = 1.0 - exp(
-                        -params.density * accumulated_density * light_step_size * 6.0
-                    );
-            float direct_scattering = 2.0 * beers * powder;
-            vec3 ambient = mix(ground_light, ambient_light, smoothstep(0.0, 1.0, height_frac));
-            alpha += (1.0 - step_transmittance) * (1.0 - alpha);
-            vec3 radiance = (ambient + direct_scattering * direct_light * phase) * cloud_density;
-            luminance += transmittance
-                    * (radiance - radiance * step_transmittance)
-                    / max(0.0000001, cloud_density);
+            float ambient_ao = max(
+                clamp(config.lighting.z, 0.0, 1.0),
+                1.0 / (
+                    1.0
+                    + max(config.lighting.y, 0.0) * cloud_density * cloud_density
+                )
+            );
+            vec3 ambient = mix(
+                ground_light,
+                ambient_light,
+                smoothstep(0.0, 1.0, height_frac)
+            ) * ambient_ao;
+            vec3 source_radiance = ambient
+                + direct_light * (single_scattering + multiple_scattering);
+            luminance += transmittance * source_radiance * segment_alpha;
             transmittance *= step_transmittance;
+
+            if (transmittance <= early_exit) {
+                break;
+            }
         }
+
+        p += direction * step_size;
     }
 
-    return vec4(luminance, clamp(alpha, 0.0, 1.0));
+    float alpha = clamp(1.0 - transmittance, 0.0, 1.0);
+    vec3 cloud_color = alpha > EPSILON ? luminance / alpha : vec3(0.0);
+    if (alpha > EPSILON && config.aerial.x > 0.0) {
+        float horizon = pow(
+            max(1.0 - clamp(direction.y, 0.0, 1.0), 0.0),
+            max(config.aerial.y, EPSILON)
+        );
+        float relative_distance = ray_length / max(config.layer.y, 1.0);
+        float distance_fade = 1.0 - exp(
+            -max(config.aerial.z, 0.0) * relative_distance
+        );
+        float aerial_amount = clamp(config.aerial.x * horizon * distance_fade, 0.0, 1.0);
+        cloud_color = mix(cloud_color, params.ambient_color, aerial_amount);
+    }
+
+    return vec4(cloud_color, alpha);
 }
 
-vec4 render_sky_direction(vec3 direction) {
+vec4 render_sky_direction(vec3 direction, float jitter) {
     if (direction.y <= 0.0) {
         return vec4(0.0);
     }
 
     vec3 camera_position = vec3(0.0, GROUND_RADIUS, 0.0);
-    vec3 start = camera_position
-            + direction * intersect_sphere(camera_position, direction, CLOUD_BOTTOM_RADIUS);
-    vec3 end = camera_position
-            + direction * intersect_sphere(camera_position, direction, CLOUD_TOP_RADIUS);
-    const float STEP_COUNT = 128.0;
-    vec3 ray_step = direction * length(end - start) / STEP_COUNT;
-    return march_clouds(start, ray_step, int(STEP_COUNT));
+    float start_distance = sphere_far_distance(
+        camera_position,
+        direction,
+        cloud_bottom_radius()
+    );
+    float end_distance = sphere_far_distance(
+        camera_position,
+        direction,
+        cloud_top_radius()
+    );
+    if (start_distance < 0.0 || end_distance <= start_distance) {
+        return vec4(0.0);
+    }
+
+    vec3 start = camera_position + direction * start_distance;
+    float ray_length = end_distance - start_distance;
+    int step_count = int(clamp(floor(config.sampling.x + 0.5), 1.0, 160.0));
+    return march_clouds(start, direction, ray_length, step_count, jitter);
 }
 
 vec2 oct_wrap(vec2 value) {
@@ -230,7 +406,16 @@ void main() {
     if (pixel.x >= int(params.texture_size.x) || pixel.y >= int(params.texture_size.y)) {
         return;
     }
+    ivec2 blue_size = max(textureSize(blue_noise, 0), ivec2(1));
+    ivec2 phased_pixel = pixel + ivec2(floor(params.pad1));
+    ivec2 blue_coord = ivec2(
+        ((phased_pixel.x % blue_size.x) + blue_size.x) % blue_size.x,
+        ((phased_pixel.y % blue_size.y) + blue_size.y) % blue_size.y
+    );
+    float blue_value = texelFetch(blue_noise, blue_coord, 0).r;
+    float jitter = mix(0.5, blue_value, clamp(config.sampling.z, 0.0, 1.0));
+
     vec2 uv = vec2(pixel) / params.texture_size;
     vec3 direction = oct_to_direction(uv).xzy;
-    imageStore(current_image, pixel, render_sky_direction(direction));
+    imageStore(current_image, pixel, render_sky_direction(direction, jitter));
 }
